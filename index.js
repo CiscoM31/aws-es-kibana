@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-var AWS = require('aws-sdk');
+const { SignatureV4 } = require('@aws-sdk/signature-v4');
+const { defaultProvider, fromIni } = require('@aws-sdk/credential-providers');
+const { STSClient } = require('@aws-sdk/client-sts');
+const { createHash } = require('crypto');
 var http = require('http');
 var httpProxy = require('http-proxy');
 var express = require('express');
@@ -105,26 +108,23 @@ var BIND_ADDRESS = argv.b;
 var PORT = argv.p;
 var REQ_LIMIT = argv.l;
 
-var credentials;
+var credentialProvider;
 
 var PROFILE = process.env.AWS_PROFILE;
 
 if (!PROFILE) {
-    var chain = new AWS.CredentialProviderChain();
-    chain.resolve(function (err, resolved) {
-        if (err) throw err;
-        else credentials = resolved;
-    });
+    credentialProvider = defaultProvider();
 } else {
-    credentials = new AWS.SharedIniFileCredentials({profile: PROFILE});
-    AWS.config.credentials = credentials;
+    credentialProvider = fromIni({ profile: PROFILE });
 }
 
-function getCredentials(req, res, next) {
-    return credentials.get(function (err) {
-        if (err) return next(err);
-        else return next();
-    });
+async function getCredentials(req, res, next) {
+    try {
+        req.credentials = await credentialProvider();
+        return next();
+    } catch (err) {
+        return next(err);
+    }
 }
 
 var options = {
@@ -193,24 +193,54 @@ app.use(async function (req, res) {
     proxy.web(req, res, {buffer: bufferStream});
 });
 
-proxy.on('proxyReq', function (proxyReq, req) {
-    var endpoint = new AWS.Endpoint(ENDPOINT);
-    var request = new AWS.HttpRequest(endpoint);
-    request.method = proxyReq.method;
-    request.path = proxyReq.path;
-    request.region = REGION;
-    if (Buffer.isBuffer(req.body)) request.body = req.body;
-    if (!request.headers) request.headers = {};
-    request.headers['presigned-expires'] = false;
-    request.headers['Host'] = endpoint.hostname;
+proxy.on('proxyReq', async function (proxyReq, req) {
+    try {
+        const credentials = await credentialProvider();
+        
+        // Parse the URL to get the hostname
+        const url = new URL(ENDPOINT);
+        const hostname = url.hostname;
+        
+        // Create the request object for signing
+        const request = {
+            method: proxyReq.method,
+            hostname: hostname,
+            path: proxyReq.path,
+            protocol: 'https:',
+            headers: {
+                'Host': hostname,
+                'presigned-expires': false
+            }
+        };
 
-    var signer = new AWS.Signers.V4(request, 'es');
-    signer.addAuthorization(credentials, new Date());
+        // Add body if present
+        if (Buffer.isBuffer(req.body)) {
+            request.body = req.body;
+            request.headers['Content-Length'] = req.body.length;
+        }
 
-    proxyReq.setHeader('Host', request.headers['Host']);
-    proxyReq.setHeader('X-Amz-Date', request.headers['X-Amz-Date']);
-    proxyReq.setHeader('Authorization', request.headers['Authorization']);
-    if (request.headers['x-amz-security-token']) proxyReq.setHeader('x-amz-security-token', request.headers['x-amz-security-token']);
+        // Create the signer
+        const signer = new SignatureV4({
+            service: 'es',
+            region: REGION,
+            credentials: credentials,
+            sha256: (data) => createHash('sha256').update(data).digest('hex')
+        });
+
+        // Sign the request
+        const signedRequest = await signer.sign(request);
+
+        // Apply the signed headers to the proxy request
+        proxyReq.setHeader('Host', signedRequest.headers['Host']);
+        proxyReq.setHeader('X-Amz-Date', signedRequest.headers['X-Amz-Date']);
+        proxyReq.setHeader('Authorization', signedRequest.headers['Authorization']);
+        
+        if (signedRequest.headers['X-Amz-Security-Token']) {
+            proxyReq.setHeader('X-Amz-Security-Token', signedRequest.headers['X-Amz-Security-Token']);
+        }
+    } catch (error) {
+        console.error('Error signing request:', error);
+    }
 });
 
 proxy.on('proxyRes', function (proxyReq, req, res) {
@@ -236,6 +266,10 @@ if (argv.H) {
 }
 
 fs.watch(`${homedir}/.aws/credentials`, (eventType, filename) => {
-    credentials = new AWS.SharedIniFileCredentials({profile: PROFILE});
-    AWS.config.credentials = credentials;
+    if (PROFILE) {
+        credentialProvider = fromIni({ profile: PROFILE });
+    } else {
+        credentialProvider = defaultProvider();
+    }
 });
+
