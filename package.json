@@ -32,9 +32,9 @@
     "aws-es-kibana": "index.js"
   },
   "dependencies": {
-    "@aws-sdk/client-sts": "latest",
-    "@aws-sdk/credential-providers": "latest",
-    "@aws-sdk/signature-v4": "latest",
+    "@aws-sdk/client-sts": "^3.894.0",
+    "@aws-sdk/credential-providers": "^3.894.0",
+    "@smithy/signature-v4": "^5.2.1",
     "body-parser": "^1.15.2",
     "compression": "^1.6.2",
     "express": "^4.14.0",
