@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { SignatureV4 } = require('@smithy/signature-v4');
-const { defaultProvider, fromIni } = require('@aws-sdk/credential-providers');
+const { fromNodeProviderChain, fromIni } = require('@aws-sdk/credential-providers');
 const { STSClient } = require('@aws-sdk/client-sts');
 const { createHash } = require('crypto');
 var http = require('http');
@@ -113,7 +113,7 @@ var credentialProvider;
 var PROFILE = process.env.AWS_PROFILE;
 
 if (!PROFILE) {
-    credentialProvider = defaultProvider();
+    credentialProvider = fromNodeProviderChain();
 } else {
     credentialProvider = fromIni({ profile: PROFILE });
 }
@@ -269,7 +269,7 @@ fs.watch(`${homedir}/.aws/credentials`, (eventType, filename) => {
     if (PROFILE) {
         credentialProvider = fromIni({ profile: PROFILE });
     } else {
-        credentialProvider = defaultProvider();
+        credentialProvider = fromNodeProviderChain();
     }
 });
 
