@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { SignatureV4 } = require('@aws-sdk/signature-v4');
+const { SignatureV4 } = require('@smithy/signature-v4');
 const { defaultProvider, fromIni } = require('@aws-sdk/credential-providers');
 const { STSClient } = require('@aws-sdk/client-sts');
 const { createHash } = require('crypto');
