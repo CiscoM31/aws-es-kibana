@@ -198,7 +198,8 @@ proxy.on('proxyReq', async function (proxyReq, req) {
         const credentials = await credentialProvider();
         
         // Parse the URL to get the hostname
-        const url = new URL(ENDPOINT);
+        const fullUrl = ENDPOINT.startsWith('http') ? ENDPOINT : `https://${ENDPOINT}`;
+        const url = new URL(fullUrl); 
         const hostname = url.hostname;
         
         // Create the request object for signing
