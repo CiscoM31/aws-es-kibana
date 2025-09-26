@@ -185,32 +185,23 @@ if (argv.u && argv.a) {
 }
 
 app.use(async function (req, res) {
-    var bufferStream;
-    if (Buffer.isBuffer(req.body)) {
-        var bufferStream = new stream.PassThrough();
-        await bufferStream.end(req.body);
-    }
-    proxy.web(req, res, {buffer: bufferStream});
-});
-
-proxy.on('proxyReq', async function (proxyReq, req) {
     try {
         const credentials = await credentialProvider();
         
         // Parse the URL to get the hostname
+        // Ensure ENDPOINT has a protocol scheme
         const fullUrl = ENDPOINT.startsWith('http') ? ENDPOINT : `https://${ENDPOINT}`;
-        const url = new URL(fullUrl); 
+        const url = new URL(fullUrl);
         const hostname = url.hostname;
         
         // Create the request object for signing
         const request = {
-            method: proxyReq.method,
+            method: req.method,
             hostname: hostname,
-            path: proxyReq.path,
+            path: req.url,
             protocol: 'https:',
             headers: {
-                'Host': hostname,
-                'presigned-expires': false
+                'Host': hostname
             }
         };
 
@@ -225,22 +216,52 @@ proxy.on('proxyReq', async function (proxyReq, req) {
             service: 'es',
             region: REGION,
             credentials: credentials,
-            sha256: (data) => createHash('sha256').update(data).digest('hex')
+            sha256: function Sha256Hash(secret) {
+                this.hash = createHash('sha256');
+                if (secret) {
+                    this.hash.update(secret);
+                }
+                
+                this.update = function(data) {
+                    this.hash.update(data);
+                    return this;
+                };
+                
+                this.digest = function() {
+                    return new Uint8Array(this.hash.digest());
+                };
+            }
         });
 
         // Sign the request
         const signedRequest = await signer.sign(request);
-
-        // Apply the signed headers to the proxy request
-        proxyReq.setHeader('Host', signedRequest.headers['Host']);
-        proxyReq.setHeader('X-Amz-Date', signedRequest.headers['X-Amz-Date']);
-        proxyReq.setHeader('Authorization', signedRequest.headers['Authorization']);
         
-        if (signedRequest.headers['X-Amz-Security-Token']) {
-            proxyReq.setHeader('X-Amz-Security-Token', signedRequest.headers['X-Amz-Security-Token']);
+        // Debug: Log the signed request to see what we're getting
+        console.log('Signed request headers:', JSON.stringify(signedRequest.headers, null, 2));
+
+        // Add signed headers to the original request
+        if (signedRequest.headers['Host']) {
+            req.headers['Host'] = signedRequest.headers['Host'];
         }
+        if (signedRequest.headers['X-Amz-Date']) {
+            req.headers['X-Amz-Date'] = signedRequest.headers['X-Amz-Date'];
+        }
+        if (signedRequest.headers['Authorization']) {
+            req.headers['Authorization'] = signedRequest.headers['Authorization'];
+        }
+        if (signedRequest.headers['X-Amz-Security-Token']) {
+            req.headers['X-Amz-Security-Token'] = signedRequest.headers['X-Amz-Security-Token'];
+        }
+
+        var bufferStream;
+        if (Buffer.isBuffer(req.body)) {
+            var bufferStream = new stream.PassThrough();
+            await bufferStream.end(req.body);
+        }
+        proxy.web(req, res, {buffer: bufferStream});
     } catch (error) {
         console.error('Error signing request:', error);
+        res.status(500).send('Error signing request');
     }
 });
 
@@ -273,4 +294,3 @@ fs.watch(`${homedir}/.aws/credentials`, (eventType, filename) => {
         credentialProvider = fromNodeProviderChain();
     }
 });
-
