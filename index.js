@@ -195,20 +195,45 @@ app.use(async function (req, res) {
         const hostname = url.hostname;
         
         // Create the request object for signing
+        // Sanitize headers to ensure all values are strings
+        const sanitizedHeaders = {
+            'Host': hostname
+        };
+        
+        // Copy and sanitize incoming headers, converting all values to strings
+        for (const [key, value] of Object.entries(req.headers)) {
+            if (value !== undefined && value !== null) {
+                // Convert arrays to comma-separated strings, objects to JSON, everything else to string
+                if (Array.isArray(value)) {
+                    sanitizedHeaders[key] = value.join(', ');
+                } else if (typeof value === 'object') {
+                    sanitizedHeaders[key] = JSON.stringify(value);
+                } else {
+                    sanitizedHeaders[key] = String(value);
+                }
+            }
+        }
+        
+        // Double-check: ensure ALL header values are strings
+        for (const [key, value] of Object.entries(sanitizedHeaders)) {
+            if (typeof value !== 'string') {
+                console.error(`Non-string header detected: ${key} = ${value} (type: ${typeof value})`);
+                sanitizedHeaders[key] = String(value);
+            }
+        }
+        
         const request = {
             method: req.method,
             hostname: hostname,
             path: req.url,
             protocol: 'https:',
-            headers: {
-                'Host': hostname
-            }
+            headers: sanitizedHeaders
         };
 
         // Add body if present
         if (Buffer.isBuffer(req.body)) {
             request.body = req.body;
-            request.headers['Content-Length'] = req.body.length;
+            request.headers['Content-Length'] = String(req.body.length);
         }
 
         // Create the signer
@@ -234,10 +259,16 @@ app.use(async function (req, res) {
         });
 
         // Sign the request
-        const signedRequest = await signer.sign(request);
-        
-        // Debug: Log the signed request to see what we're getting
-        console.log('Signed request headers:', JSON.stringify(signedRequest.headers, null, 2));
+        let signedRequest;
+        try {
+            signedRequest = await signer.sign(request);
+        } catch (signingError) {
+            console.error('Signing failed. Request headers:');
+            for (const [key, value] of Object.entries(request.headers)) {
+                console.error(`  ${key}: ${value} (type: ${typeof value})`);
+            }
+            throw signingError;
+        }
 
         // Add signed headers to the original request
         if (signedRequest.headers['Host']) {
@@ -294,3 +325,4 @@ fs.watch(`${homedir}/.aws/credentials`, (eventType, filename) => {
         credentialProvider = fromNodeProviderChain();
     }
 });
+
