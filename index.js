@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-const { SignatureV4 } = require('@smithy/signature-v4');
-const { fromNodeProviderChain, fromIni } = require('@aws-sdk/credential-providers');
+const { fromNodeProviderChain, fromIni, fromInstanceMetadata, fromContainerMetadata } = require('@aws-sdk/credential-providers');
 const { STSClient } = require('@aws-sdk/client-sts');
-const { createHash } = require('crypto');
+const { HttpRequest } = require('@aws-sdk/protocol-http');
+const { Sha256 } = require('@aws-crypto/sha256-js');
+const { SignatureV4 } = require('@aws-sdk/signature-v4');
 var http = require('http');
 var httpProxy = require('http-proxy');
 var express = require('express');
@@ -113,9 +114,23 @@ var credentialProvider;
 var PROFILE = process.env.AWS_PROFILE;
 
 if (!PROFILE) {
-    credentialProvider = fromNodeProviderChain();
+    credentialProvider = fromNodeProviderChain({
+        timeout: 5000, // 5 second timeout
+        maxRetries: 3
+    });
 } else {
     credentialProvider = fromIni({ profile: PROFILE });
+}
+
+// Validate credentials at startup
+async function validateCredentials() {
+    try {
+        const credentials = await credentialProvider();
+        return credentials;
+    } catch (error) {
+        console.error('Failed to load AWS credentials:', error.message);
+        throw error;
+    }
 }
 
 async function getCredentials(req, res, next) {
@@ -123,6 +138,7 @@ async function getCredentials(req, res, next) {
         req.credentials = await credentialProvider();
         return next();
     } catch (err) {
+        console.error('Credential fetch failed in middleware:', err.message);
         return next(err);
     }
 }
@@ -171,7 +187,6 @@ if (argv.H) {
 }
 
 if (argv.u && argv.a) {
-
   var users = {};
   var user = process.env.USER || process.env.AUTH_USER;
   var pass = process.env.PASSWORD || process.env.AUTH_PASSWORD;
@@ -188,106 +203,117 @@ app.use(async function (req, res) {
     try {
         const credentials = await credentialProvider();
         
+        // Validate credentials are properly loaded
+        if (!credentials || !credentials.accessKeyId || !credentials.secretAccessKey) {
+            console.error('Invalid AWS credentials received');
+            return res.status(500).json({ error: 'AWS credentials not properly configured' });
+        }
+        
         // Parse the URL to get the hostname
-        // Ensure ENDPOINT has a protocol scheme
         const fullUrl = ENDPOINT.startsWith('http') ? ENDPOINT : `https://${ENDPOINT}`;
         const url = new URL(fullUrl);
         const hostname = url.hostname;
         
-        // Create the request object for signing
-        // Sanitize headers to ensure all values are strings
-        const sanitizedHeaders = {
-            'Host': hostname
-        };
+        // Handle Kibana Dev Tools proxy requests
+        let actualMethod = req.method;
+        let actualPath = req.url;
+        let actualBody = undefined; // Start with undefined instead of empty buffer
         
-        // Copy and sanitize incoming headers, converting all values to strings
-        for (const [key, value] of Object.entries(req.headers)) {
-            if (value !== undefined && value !== null) {
-                // Convert arrays to comma-separated strings, objects to JSON, everything else to string
-                if (Array.isArray(value)) {
-                    sanitizedHeaders[key] = value.join(', ');
-                } else if (typeof value === 'object') {
-                    sanitizedHeaders[key] = JSON.stringify(value);
-                } else {
-                    sanitizedHeaders[key] = String(value);
+        // Properly handle request body
+        if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+            actualBody = req.body;
+        } else if (req.body && typeof req.body === 'string' && req.body.length > 0) {
+            actualBody = Buffer.from(req.body, 'utf8');
+        }
+        
+        // Check if this is a Kibana Dev Tools request
+        if (req.url.startsWith('/_dashboards/api/console/proxy')) {
+            const urlObj = new URL(req.url, 'http://localhost');
+            const method = urlObj.searchParams.get('method');
+            const path = urlObj.searchParams.get('path');
+            
+            if (method && path) {
+                actualMethod = method;
+                actualPath = '/' + decodeURIComponent(path);
+                // For GET/HEAD requests, clear the body
+                if (method === 'GET' || method === 'HEAD') {
+                    actualBody = undefined;
                 }
+                // For POST/PUT/etc., keep the original body which contains the ES request
             }
         }
-        
-        // Double-check: ensure ALL header values are strings
-        for (const [key, value] of Object.entries(sanitizedHeaders)) {
-            if (typeof value !== 'string') {
-                console.error(`Non-string header detected: ${key} = ${value} (type: ${typeof value})`);
-                sanitizedHeaders[key] = String(value);
-            }
-        }
-        
-        const request = {
-            method: req.method,
-            hostname: hostname,
-            path: req.url,
-            protocol: 'https:',
-            headers: sanitizedHeaders
+
+        // Create headers for AWS request
+        const awsHeaders = {
+            'host': hostname
         };
-
-        // Add body if present
-        if (Buffer.isBuffer(req.body)) {
-            request.body = req.body;
-            request.headers['Content-Length'] = String(req.body.length);
+        
+        // Add content-type for requests with body
+        if (actualBody && actualMethod !== 'GET' && actualMethod !== 'HEAD') {
+            awsHeaders['content-type'] = 'application/json';
         }
+        
+        const awsRequest = new HttpRequest({
+            method: actualMethod,
+            hostname: hostname,
+            path: actualPath,
+            protocol: 'https:',
+            headers: awsHeaders,
+            body: actualBody // This will be undefined for GET requests, proper Buffer for POST
+        });
 
-        // Create the signer
+        // Create the signer using proper AWS SDK classes
         const signer = new SignatureV4({
             service: 'es',
             region: REGION,
             credentials: credentials,
-            sha256: function Sha256Hash(secret) {
-                this.hash = createHash('sha256');
-                if (secret) {
-                    this.hash.update(secret);
-                }
-                
-                this.update = function(data) {
-                    this.hash.update(data);
-                    return this;
-                };
-                
-                this.digest = function() {
-                    return new Uint8Array(this.hash.digest());
-                };
-            }
+            sha256: Sha256
         });
 
         // Sign the request
         let signedRequest;
         try {
-            signedRequest = await signer.sign(request);
+            // Debug logging
+            console.log('Signing request:', {
+                method: actualMethod,
+                path: actualPath,
+                hasBody: !!actualBody,
+                bodyLength: actualBody ? actualBody.length : 0,
+                headers: Object.keys(awsHeaders)
+            });
+            
+            signedRequest = await signer.sign(awsRequest);
+            
         } catch (signingError) {
-            console.error('Signing failed. Request headers:');
-            for (const [key, value] of Object.entries(request.headers)) {
-                console.error(`  ${key}: ${value} (type: ${typeof value})`);
-            }
+            // Log failed requests to help debug Kibana index discovery issues
+            console.error('AWS request signing failed:', signingError.message);
+            console.error('Failed request details:', {
+                method: actualMethod,
+                path: actualPath,
+                hasBody: actualBody.length > 0
+            });
             throw signingError;
         }
 
-        // Add signed headers to the original request
-        if (signedRequest.headers['Host']) {
-            req.headers['Host'] = signedRequest.headers['Host'];
+        // Copy AWS headers to the request
+        for (const [headerName, headerValue] of Object.entries(signedRequest.headers)) {
+            req.headers[headerName] = headerValue;
         }
-        if (signedRequest.headers['X-Amz-Date']) {
-            req.headers['X-Amz-Date'] = signedRequest.headers['X-Amz-Date'];
-        }
-        if (signedRequest.headers['Authorization']) {
-            req.headers['Authorization'] = signedRequest.headers['Authorization'];
-        }
-        if (signedRequest.headers['X-Amz-Security-Token']) {
-            req.headers['X-Amz-Security-Token'] = signedRequest.headers['X-Amz-Security-Token'];
+
+        // For Kibana Dev Tools requests, rewrite the request URL and method before proxying
+        if (req.url.startsWith('/_dashboards/api/console/proxy')) {
+            req.method = actualMethod;
+            req.url = actualPath;
+            // For requests with body content, ensure the body is properly set
+            if (actualBody) {
+                req.body = actualBody;
+            }
         }
 
         var bufferStream;
-        if (Buffer.isBuffer(req.body)) {
+        if (actualBody && actualBody.length > 0) {
             var bufferStream = new stream.PassThrough();
-            await bufferStream.end(req.body);
+            await bufferStream.end(actualBody);
         }
         proxy.web(req, res, {buffer: bufferStream});
     } catch (error) {
@@ -296,27 +322,48 @@ app.use(async function (req, res) {
     }
 });
 
+
+
 proxy.on('proxyRes', function (proxyReq, req, res) {
     if (req.url.match(/\.(css|js|img|font)/)) {
         res.setHeader('Cache-Control', 'public, max-age=86400');
     }
 });
 
-http.createServer(app).listen(PORT, BIND_ADDRESS);
+proxy.on('error', function (err, req, res) {
+    console.error('Proxy error:', err.message);
+    console.error('Request details:', {
+        method: req.method,
+        url: req.url,
+        headers: req.headers
+    });
+    res.writeHead(500, {
+        'Content-Type': 'text/plain'
+    });
+    res.end('Proxy error: ' + err.message);
+});
 
-if(!argv.s) {
-    console.log(figlet.textSync('AWS ES Proxy!', {
-        font: 'Speed',
-        horizontalLayout: 'default',
-        verticalLayout: 'default'
-    }));
-}
-
-console.log('AWS ES cluster available at http://' + BIND_ADDRESS + ':' + PORT);
-console.log('Kibana available at http://' + BIND_ADDRESS + ':' + PORT + '/_plugin/kibana/');
-if (argv.H) {
-    console.log('Health endpoint enabled at http://' + BIND_ADDRESS + ':' + PORT + argv.H);
-}
+// Validate credentials before starting server
+validateCredentials().then(() => {
+    http.createServer(app).listen(PORT, BIND_ADDRESS);
+    
+    if(!argv.s) {
+        console.log(figlet.textSync('AWS ES Proxy!', {
+            font: 'Speed',
+            horizontalLayout: 'default',
+            verticalLayout: 'default'
+        }));
+    }
+    
+    console.log('AWS ES cluster available at http://' + BIND_ADDRESS + ':' + PORT);
+    console.log('Kibana available at http://' + BIND_ADDRESS + ':' + PORT + '/_plugin/kibana/');
+    if (argv.H) {
+        console.log('Health endpoint enabled at http://' + BIND_ADDRESS + ':' + PORT + argv.H);
+    }
+}).catch((error) => {
+    console.error('Startup failed - cannot load AWS credentials:', error.message);
+    process.exit(1);
+});
 
 fs.watch(`${homedir}/.aws/credentials`, (eventType, filename) => {
     if (PROFILE) {
@@ -325,4 +372,3 @@ fs.watch(`${homedir}/.aws/credentials`, (eventType, filename) => {
         credentialProvider = fromNodeProviderChain();
     }
 });
-
